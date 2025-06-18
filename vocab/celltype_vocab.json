@@ -1,0 +1,10 @@
+{
+    "macrophage": 0,
+    "microcirculation associated smooth muscle cell": 1,
+    "fibroblast": 2,
+    "endothelial cell of artery": 3,
+    "blood vessel smooth muscle cell": 4,
+    "lymphocyte": 5,
+    "unknown": 6,
+    "skin fibroblast": 7
+}
