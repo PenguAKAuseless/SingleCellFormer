@@ -16,10 +16,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, ConcatDataset
 from torch.cuda.amp.autocast_mode import autocast
 from torch.cuda.amp.grad_scaler import GradScaler
-from models.scEncoder import scEncoder
+from models.scDecoder import scDecoder
 from dataset.SingleCellDataset import SingleCellDataset
 from utils.utils import setup_logging, load_vocabulary
-from models.scEncoderLoss import scencoder_loss
+from models.scDecoderLoss import scdecoder_loss
 import numpy as np
 import anndata
 from scipy.sparse import issparse
@@ -27,8 +27,7 @@ from scipy.sparse import issparse
 def train(args):
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     os.makedirs(args.output_dir, exist_ok=True)
-    os.makedirs(args.log_dir, exist_ok=True)
-    log_file = os.path.join(args.log_dir, f'encoder_train_{timestamp}.log')
+    log_file = os.path.join(args.log_dir, f'train_{timestamp}.log')
     setup_logging(log_file)
     
     logging.info("Loading AnnData objects from directory")
@@ -67,8 +66,8 @@ def train(args):
     combined_dataset = ConcatDataset(datasets)
     logging.info(f"Combined {len(datasets)} datasets with total {len(combined_dataset)} samples")
     
-    # Initialize model
-    model = scEncoder(
+    # Initialize model with gradient checkpointing support
+    model = scDecoder(
         gene_vocab_size=len(gene_vocab),
         cell_type_vocab_size=len(cell_type_vocab) if cell_type_vocab else None,
         disease_vocab_size=len(disease_vocab) if disease_vocab else None,
@@ -80,14 +79,19 @@ def train(args):
         num_layers=args.num_layers,
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
-        gradient_checkpointing=args.gradient_checkpointing,
-        mask_prob=args.mlm_prob,  # Pass MLM probability to model
-        mask_token_id=0  # Assuming 0 is the mask token ID
+        mask_prob=args.mask_prob,
+        gradient_checkpointing=args.gradient_checkpointing  # Added gradient checkpointing parameter
     ).to(args.device)
+    
+    # Log gradient checkpointing status
+    if args.gradient_checkpointing:
+        logging.info("Gradient checkpointing enabled - trading computation for memory")
+    else:
+        logging.info("Gradient checkpointing disabled - using standard forward pass")
     
     # Load checkpoint if provided
     if args.checkpoint_path and os.path.exists(args.checkpoint_path):
-        model.load_state_dict(torch.load(args.checkpoint_path, map_location=args.device))
+        model.load_state_dict(torch.load(args.checkpoint_path))
         logging.info(f"Loaded checkpoint from {args.checkpoint_path}")
     
     # Setup optimizer and scaler
@@ -114,47 +118,32 @@ def train(args):
         
         for batch_idx, data in enumerate(dataloader):
             try:
-                # Prepare input dictionary - ensure all data is properly formatted
-                inputs = {}
+                # Prepare input dictionary
+                inputs = {
+                    'gene_ids': data['gene_ids'].to(args.device, non_blocking=True),
+                    'gene_expr': data['gene_expr'].to(args.device, non_blocking=True),
+                    'cell_type': data['cell_type'].to(args.device, non_blocking=True),
+                    'disease': data['disease'].to(args.device, non_blocking=True),
+                    'tissue': data['tissue'].to(args.device, non_blocking=True)
+                }
                 
-                # Required inputs
-                inputs['gene_ids'] = data['gene_ids'].to(args.device, non_blocking=True)
-                inputs['gene_expr'] = data['gene_expr'].to(args.device, non_blocking=True)
-                
-                # Optional metadata inputs - only add if they exist and are not None/empty
-                if 'cell_type' in data and data['cell_type'] is not None:
-                    inputs['cell_type'] = data['cell_type'].to(args.device, non_blocking=True)
-                if 'disease' in data and data['disease'] is not None:
-                    inputs['disease'] = data['disease'].to(args.device, non_blocking=True)
-                if 'tissue' in data and data['tissue'] is not None:
-                    inputs['tissue'] = data['tissue'].to(args.device, non_blocking=True)
-                
-                # Forward pass with mixed precision - let model create its own mask
+                # Forward pass with mixed precision
                 with autocast(enabled=args.device == 'cuda'):
-                    outputs = model(inputs, create_mask=True)  # Model will create mask during training
-                    
-                    # Extract the mask created by the model
-                    mask = outputs.get('mask', None)
-                    
-                    # If no mask was created (shouldn't happen during training), create one
-                    if mask is None:
-                        mask = torch.rand(inputs['gene_ids'].shape, device=args.device) < args.mlm_prob
-                        mask = mask & (inputs['gene_expr'] > 0)  # Only mask non-zero expressions
-                    
-                    # Calculate loss using the improved loss function
-                    loss_dict = scencoder_loss(
+                    outputs = model(
+                        inputs,
+                        cell_type=inputs['cell_type'],
+                        disease=inputs['disease'],
+                        tissue=inputs['tissue'],
+                        create_mask=True
+                    )
+                    loss_dict = scdecoder_loss(
                         outputs=outputs,
-                        targets=inputs,  # Use inputs as targets since we're doing self-supervised learning
-                        mask=mask,
+                        targets=inputs,
                         model=model,
                         args=args,
                         device=args.device
                     )
                     loss = loss_dict['total_loss']
-                    
-                    # Convert to tensor if it's not already
-                    if not isinstance(loss, torch.Tensor):
-                        loss = torch.tensor(loss, device=args.device, requires_grad=True)
                     
                     # Normalize loss for gradient accumulation
                     loss = loss / accumulation_steps
@@ -177,13 +166,17 @@ def train(args):
                 total_loss += loss.item() * accumulation_steps
                 
                 if batch_idx % args.log_interval == 0:
+                    # Enhanced logging to include gradient checkpointing status
+                    gc_status = "GC" if args.gradient_checkpointing else "NoGC"
                     logging.info(
-                        f"Epoch {epoch+1}/{args.epochs}, Batch {batch_idx}, Batch Size: {batch_size}, "
+                        f"Epoch {epoch+1}/{args.epochs}, Batch {batch_idx}, Batch Size: {batch_size}, {gc_status}, "
                         f"Total Loss: {loss.item() * accumulation_steps:.4f}, "
-                        f"MLM: {loss_dict['mlm_loss']:.4f}, Cont: {loss_dict['cont_loss']:.4f}, "
-                        f"Gene: {loss_dict['gene_loss']:.4f}, Cell: {loss_dict['cell_loss']:.4f}, "
-                        f"Disease: {loss_dict['disease_loss']:.4f}, Tissue: {loss_dict['tissue_loss']:.4f}, "
-                        f"Contrastive: {loss_dict['contrastive_loss']:.4f}"
+                        f"Masked Expr: {loss_dict['masked_expr_loss']:.4f}, "
+                        f"Masked Gene: {loss_dict['masked_gene_loss']:.4f}, "
+                        f"Cell: {loss_dict['cell_loss']:.4f}, "
+                        f"Disease: {loss_dict['disease_loss']:.4f}, "
+                        f"Tissue: {loss_dict['tissue_loss']:.4f}, "
+                        f"L2: {loss_dict['l2_loss']:.4f}"
                     )
                 
                 # Clear unused memory
@@ -202,8 +195,7 @@ def train(args):
                         pin_memory=True if args.device == 'cuda' else False
                     )
                     optimizer.zero_grad()
-                    if args.device == 'cuda':
-                        torch.cuda.empty_cache()
+                    torch.cuda.empty_cache()
                     continue
                 else:
                     logging.error(f"Error during training: {e}")
@@ -211,7 +203,7 @@ def train(args):
         
         # Save checkpoint
         if (epoch + 1) % args.checkpoint_interval == 0:
-            checkpoint_path = os.path.join(args.output_dir, f'encoder_checkpoint_epoch_{epoch+1}_{timestamp}.pth')
+            checkpoint_path = os.path.join(args.output_dir, f'checkpoint_epoch_{epoch+1}_{timestamp}.pth')
             torch.save(model.state_dict(), checkpoint_path)
             logging.info(f"Saved checkpoint to {checkpoint_path}")
         
@@ -226,7 +218,7 @@ def train(args):
         logging.info("Final model saving skipped as no path was provided")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Train scEncoder model')
+    parser = argparse.ArgumentParser(description='Train scDecoder model')
     parser.add_argument('--data-dir', type=str, required=True, help='Directory containing AnnData files (.h5ad)')
     parser.add_argument('--gene-vocab-path', type=str, required=True, help='Path to gene vocabulary JSON')
     parser.add_argument('--cell-type-vocab-path', type=str, default=None, help='Path to cell type vocabulary JSON')
@@ -245,22 +237,19 @@ if __name__ == '__main__':
     parser.add_argument('--num-layers', type=int, default=12, help='Number of transformer layers')
     parser.add_argument('--hidden-dim', type=int, default=2048, help='Hidden dimension of feedforward network')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
+    parser.add_argument('--mask-prob', type=float, default=0.15, help='Probability of masking tokens for training')
     parser.add_argument('--checkpoint-path', type=str, default=None, help='Path to model checkpoint to resume training')
     parser.add_argument('--checkpoint-interval', type=int, default=5, help='Save checkpoint every N epochs')
     parser.add_argument('--final-model-path', type=str, default=None, help='Path to save the final model')
     parser.add_argument('--log-interval', type=int, default=100, help='Log every N batches')
     parser.add_argument('--num-workers', type=int, default=4, help='Number of data loader workers')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device to train on')
-    parser.add_argument('--gradient-checkpointing', action='store_true', help='Enable gradient checkpointing')
-    parser.add_argument('--mlm-prob', type=float, default=0.15, help='Probability of masking tokens for MLM')
-    parser.add_argument('--mlm-weight', type=float, default=1.0, help='Weight for MLM loss')
-    parser.add_argument('--cont-weight', type=float, default=1.0, help='Weight for continuous regression loss')
-    parser.add_argument('--gene-weight', type=float, default=1.0, help='Weight for gene ID classification loss')
+    parser.add_argument('--gradient-checkpointing', action='store_true', help='Enable gradient checkpointing to save memory')  # Added gradient checkpointing argument
+    parser.add_argument('--expr-weight', type=float, default=1.0, help='Weight for masked expression loss')
+    parser.add_argument('--gene-weight', type=float, default=1.0, help='Weight for masked gene ID loss')
     parser.add_argument('--cell-weight', type=float, default=1.0, help='Weight for cell type classification loss')
     parser.add_argument('--disease-weight', type=float, default=1.0, help='Weight for disease classification loss')
     parser.add_argument('--tissue-weight', type=float, default=1.0, help='Weight for tissue classification loss')
-    parser.add_argument('--contrastive-weight', type=float, default=0.0, help='Weight for contrastive loss')
-    parser.add_argument('--contrastive-margin', type=float, default=0.5, help='Margin for contrastive loss')
     parser.add_argument('--l2-weight', type=float, default=0.0, help='Weight for L2 regularization')
     
     args = parser.parse_args()

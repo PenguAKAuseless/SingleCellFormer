@@ -1,8 +1,0 @@
-{
-    "silhouette_score": -0.018811943009495735,
-    "davies_bouldin_score": 6.422594839301182,
-    "calinski_harabasz_score": 196821.65442786843,
-    "dunn_index": 0.14226267135993226,
-    "adjusted_rand_score": -0.0014088625695981528,
-    "normalized_mutual_info_score": 0.0004964615786006599
-}

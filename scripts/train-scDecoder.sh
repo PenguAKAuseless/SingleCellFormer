@@ -9,7 +9,7 @@ TISSUE_VOCAB="vocab/tissue_vocab.json"      # Optional
 OUTPUT_DIR="output"
 LOG_DIR="logs"
 CHECKPOINT_PATH=""               # Optional: path to existing checkpoint
-FINAL_MODEL_PATH="final/encoder_final_model.pth"    # Set to "" to skip final model saving
+FINAL_MODEL_PATH="final/final_model.pth"    # Set to "" to skip final model saving
 BATCH_SIZE=32
 ACCUMULATION_STEPS=4
 EPOCHS=10
@@ -24,18 +24,15 @@ DROPOUT=0.1
 CHECKPOINT_INTERVAL=5
 LOG_INTERVAL=100
 NUM_WORKERS=4
-DEVICE="cuda:0"                              # Use "cpu" if CUDA is not available
-MLM_PROB=0.15
-MLM_WEIGHT=1.0
-CONT_WEIGHT=1.0
+DEVICE="cuda:1"                              # Use "cpu" if CUDA is not available
+MASK_PROB=0.15
+EXPR_WEIGHT=1.0
 GENE_WEIGHT=1.0
 CELL_WEIGHT=1.0
 DISEASE_WEIGHT=1.0
 TISSUE_WEIGHT=1.0
-CONTRASTIVE_WEIGHT=0.0
-CONTRASTIVE_MARGIN=0.5
 L2_WEIGHT=0.0
-GRADIENT_CHECKPOINTING="--gradient-checkpointing"
+GRADIENT_CHECKPOINTING="--gradient-checkpointing"  # Enable gradient checkpointing to save memory
 
 # Create output and log directories
 mkdir -p "$OUTPUT_DIR"
@@ -46,7 +43,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 # Build the command
 CMD=(
-  python3 training/train-scEncoder.py
+  python3 training/train-scDecoder.py
   --data-dir "$DATA_DIR"
   --gene-vocab-path "$GENE_VOCAB"
   --cell-type-vocab-path "$CELL_TYPE_VOCAB"
@@ -65,20 +62,17 @@ CMD=(
   --num-layers "$NUM_LAYERS"
   --hidden-dim "$HIDDEN_DIM"
   --dropout "$DROPOUT"
+  --mask-prob "$MASK_PROB"
   --checkpoint-path "$CHECKPOINT_PATH"
   --checkpoint-interval "$CHECKPOINT_INTERVAL"
   --log-interval "$LOG_INTERVAL"
   --num-workers "$NUM_WORKERS"
   --device "$DEVICE"
-  --mlm-prob "$MLM_PROB"
-  --mlm-weight "$MLM_WEIGHT"
-  --cont-weight "$CONT_WEIGHT"
+  --expr-weight "$EXPR_WEIGHT"
   --gene-weight "$GENE_WEIGHT"
   --cell-weight "$CELL_WEIGHT"
   --disease-weight "$DISEASE_WEIGHT"
   --tissue-weight "$TISSUE_WEIGHT"
-  --contrastive-weight "$CONTRASTIVE_WEIGHT"
-  --contrastive-margin "$CONTRASTIVE_MARGIN"
   --l2-weight "$L2_WEIGHT"
   "$GRADIENT_CHECKPOINTING"
 )
@@ -89,11 +83,11 @@ if [ -n "$FINAL_MODEL_PATH" ]; then
 fi
 
 # Run training with nohup
-nohup "${CMD[@]}" > "$LOG_DIR/encoder_train_out_$TIMESTAMP.log" 2> "$LOG_DIR/encoder_train_err_$TIMESTAMP.err" &
+nohup "${CMD[@]}" > "$LOG_DIR/train_out_$TIMESTAMP.log" 2> "$LOG_DIR/train_err_$TIMESTAMP.err" &
 
 # Save PID
-echo $! > "$LOG_DIR/encoder_train_pid_$TIMESTAMP.pid"
-echo "Training started with PID $(cat "$LOG_DIR/encoder_train_pid_$TIMESTAMP.pid")"
-echo "Logs: $LOG_DIR/encoder_train_out_$TIMESTAMP.log"
-echo "Errors: $LOG_DIR/encoder_train_err_$TIMESTAMP.err"
-echo "PID file: $LOG_DIR/encoder_train_pid_$TIMESTAMP.pid"
+echo $! > "$LOG_DIR/train_pid_$TIMESTAMP.pid"
+echo "Training started with PID $(cat "$LOG_DIR/train_pid_$TIMESTAMP.pid")"
+echo "Logs: $LOG_DIR/train_out_$TIMESTAMP.log"
+echo "Errors: $LOG_DIR/train_err_$TIMESTAMP.err"
+echo "PID file: $LOG_DIR/train_pid_$TIMESTAMP.pid"

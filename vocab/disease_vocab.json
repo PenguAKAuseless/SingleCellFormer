@@ -1,6 +1,3 @@
 {
-    "normal": 0,
-    "injury": 1,
-    "keloid": 2,
-    "localized scleroderma": 3
+  "normal": 0
 }

@@ -4,18 +4,18 @@ import torch.nn.functional as F
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from torch.utils.checkpoint import checkpoint
 import warnings
+import random
 
 class scEncoder(nn.Module):
     """
-    Single-cell RNA-seq Transformer Encoder Model
+    Improved Single-cell RNA-seq Transformer Encoder Model
     
-    A transformer-based model designed for single-cell RNA sequencing data analysis.
-    This model can handle gene expression data along with optional metadata such as
-    cell type, disease, and tissue information. It supports both binned and continuous
-    gene expression values and includes various prediction heads for different tasks.
-    
-    The model uses a [CLS] token for global representation and supports gradient
-    checkpointing for memory-efficient training on large datasets.
+    Key improvements:
+    1. Removed CLS token - metadata embeddings are directly summed with gene embeddings
+    2. Implements proper gene masking for autoregressive learning
+    3. Only accepts binned gene expression data for consistency
+    4. Returns masking information for loss calculation
+    5. Uses embedding summation instead of concatenation for efficiency
     """
     
     def __init__(
@@ -23,32 +23,27 @@ class scEncoder(nn.Module):
             cell_type_vocab_size=None, disease_vocab_size=None, tissue_vocab_size=None,
             batch_first=True, num_bins=51, seq_len=512,
             d_model=512, nhead=8, num_layers=12, hidden_dim=2048, dropout=0.1,
-            gradient_checkpointing=False,
+            gradient_checkpointing=False, mask_prob=0.15, mask_token_id=0
         ):
         """
-        Initialize the scEncoder model with specified architecture parameters.
+        Initialize the improved scEncoder model.
 
         Args:   
             gene_vocab_size (int): Total number of unique genes in the vocabulary
-            cell_type_vocab_size (int, optional): Number of unique cell types. 
-                If None, cell type prediction head is disabled. Default: None
-            disease_vocab_size (int, optional): Number of unique diseases. 
-                If None, disease prediction head is disabled. Default: None
-            tissue_vocab_size (int, optional): Number of unique tissues. 
-                If None, tissue prediction head is disabled. Default: None
-            batch_first (bool): Whether input tensors have batch dimension first.
-                Format: (batch, seq, feature) if True, (seq, batch, feature) if False. Default: True
-            num_bins (int): Number of discretization bins for gene expression values.
-                Used when converting continuous values to discrete tokens. Default: 51
-            seq_len (int): Maximum sequence length the model can handle.
-                Sequences are padded/truncated to this length. Default: 512
-            d_model (int): Dimensionality of model embeddings and hidden states. Default: 512
-            nhead (int): Number of attention heads in each transformer layer. Default: 8
-            num_layers (int): Number of transformer encoder layers to stack. Default: 12
-            hidden_dim (int): Dimensionality of feedforward network inside transformer. Default: 2048
-            dropout (float): Dropout probability applied throughout the model. Default: 0.1
-            gradient_checkpointing (bool): Enable gradient checkpointing to trade computation
-                for memory during training. Useful for large models. Default: False
+            cell_type_vocab_size (int, optional): Number of unique cell types
+            disease_vocab_size (int, optional): Number of unique diseases
+            tissue_vocab_size (int, optional): Number of unique tissues
+            batch_first (bool): Whether input tensors have batch dimension first
+            num_bins (int): Number of discretization bins for gene expression values
+            seq_len (int): Maximum sequence length
+            d_model (int): Dimensionality of model embeddings and hidden states
+            nhead (int): Number of attention heads in each transformer layer
+            num_layers (int): Number of transformer encoder layers to stack
+            hidden_dim (int): Dimensionality of feedforward network inside transformer
+            dropout (float): Dropout probability applied throughout the model
+            gradient_checkpointing (bool): Enable gradient checkpointing for memory efficiency
+            mask_prob (float): Probability of masking each gene for MLM training
+            mask_token_id (int): Special token ID used for masking genes
         """
         super(scEncoder, self).__init__()
         
@@ -66,256 +61,357 @@ class scEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.dropout = dropout
         self.gradient_checkpointing = gradient_checkpointing
+        self.mask_prob = mask_prob
+        self.mask_token_id = mask_token_id
 
         # ==================== EMBEDDING LAYERS ====================
-        # Gene ID embeddings: maps gene indices to dense vectors
+        # Gene ID embeddings
         self.gene_embedding = nn.Embedding(gene_vocab_size, d_model)
         
-        # Gene expression value embeddings: maps binned expression values to dense vectors
+        # Gene expression value embeddings (binned values only)
         self.value_embedding = nn.Embedding(num_bins, d_model)
         
-        # Optional metadata embeddings (only created if vocab sizes are provided)
+        # Positional embeddings for sequence positions
+        self.position_embedding = nn.Embedding(seq_len, d_model)
+        
+        # Metadata embeddings (only created if vocab sizes are provided)
+        # These will be broadcast and summed with gene embeddings
         self.cell_embedding = nn.Embedding(cell_type_vocab_size, d_model) if cell_type_vocab_size else None
         self.disease_embedding = nn.Embedding(disease_vocab_size, d_model) if disease_vocab_size else None
         self.tissue_embedding = nn.Embedding(tissue_vocab_size, d_model) if tissue_vocab_size else None
 
-        # ==================== SPECIAL TOKENS ====================
-        # [CLS] token: learnable parameter for global sequence representation
-        # Used for classification tasks and capturing sequence-level information
-        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
+        # Special mask token embedding for masked positions
+        self.mask_token_embedding = nn.Parameter(torch.randn(1, d_model))
 
         # ==================== TRANSFORMER ARCHITECTURE ====================
-        # Define transformer encoder layer with specified architecture
         encoder_layer = TransformerEncoderLayer(
-            d_model=d_model,              # Input/output dimension
-            nhead=nhead,                  # Number of attention heads
-            dim_feedforward=hidden_dim,   # Feedforward network dimension
-            dropout=dropout,              # Dropout rate
-            batch_first=batch_first,      # Batch dimension ordering
-            activation='gelu'             # Activation function (GELU works well for transformers)
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=hidden_dim,
+            dropout=dropout,
+            batch_first=batch_first,
+            activation='gelu'
         )
 
-        # Stack multiple encoder layers with layer normalization
         self.transformer_encoder = TransformerEncoder(
             encoder_layer=encoder_layer,
             num_layers=num_layers,
-            norm=nn.LayerNorm(d_model),   # Final layer normalization
+            norm=nn.LayerNorm(d_model),
         )        
 
         # ==================== OUTPUT PREDICTION HEADS ====================
-        # Masked Language Modeling head: predicts binned expression values
-        self.mlm_output = nn.Linear(d_model, num_bins)
+        # Token-level prediction heads (for each position in sequence)
+        self.gene_expr_head = nn.Sequential(
+            nn.Linear(d_model, hidden_dim // 2),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, num_bins)
+        )
         
-        # Continuous value regression head: predicts actual expression values
-        self.continuous_output = nn.Linear(d_model, 1)
+        self.gene_id_head = nn.Sequential(
+            nn.Linear(d_model, hidden_dim // 2),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, gene_vocab_size)
+        )
         
-        # Gene prediction head: predicts gene identities (for tasks like gene imputation)
-        self.gene_output = nn.Linear(d_model, gene_vocab_size)
-        
-        # Optional metadata prediction heads (only created if corresponding embeddings exist)
-        self.cell_output = nn.Linear(d_model, cell_type_vocab_size) if cell_type_vocab_size else None
-        self.disease_output = nn.Linear(d_model, disease_vocab_size) if disease_vocab_size else None
-        self.tissue_output = nn.Linear(d_model, tissue_vocab_size) if tissue_vocab_size else None
+        # Global prediction heads (for entire sequence metadata)
+        # These use a separate pooling mechanism
+        if cell_type_vocab_size:
+            self.cell_type_head = nn.Sequential(
+                nn.Linear(d_model, hidden_dim // 4),
+                nn.GELU(),
+                nn.LayerNorm(hidden_dim // 4),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim // 4, cell_type_vocab_size)
+            )
+        else:
+            self.cell_type_head = None
+            
+        if disease_vocab_size:
+            self.disease_head = nn.Sequential(
+                nn.Linear(d_model, hidden_dim // 4),
+                nn.GELU(),
+                nn.LayerNorm(hidden_dim // 4),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim // 4, disease_vocab_size)
+            )
+        else:
+            self.disease_head = None
+            
+        if tissue_vocab_size:
+            self.tissue_head = nn.Sequential(
+                nn.Linear(d_model, hidden_dim // 4),
+                nn.GELU(),
+                nn.LayerNorm(hidden_dim // 4),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim // 4, tissue_vocab_size)
+            )
+        else:
+            self.tissue_head = None
 
         # ==================== NORMALIZATION AND REGULARIZATION ====================
-        # Layer normalization for output stabilization
-        self.norm = nn.LayerNorm(d_model)
-        
-        # Dropout layer for regularization
+        self.input_norm = nn.LayerNorm(d_model)
         self.dropout_layer = nn.Dropout(dropout)
 
         # Initialize all model weights
         self._init_weights()
 
     def _init_weights(self):
-        """
-        Initialize model weights using Xavier uniform initialization.
+        """Initialize model weights using Xavier uniform initialization."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.xavier_uniform_(module.weight)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
         
-        This initialization helps with gradient flow and training stability.
-        The [CLS] token is initialized with small random values following
-        common practices in transformer models.
-        """
-        # Initialize all parameters with dimension > 1 using Xavier uniform
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
-        
-        # Initialize [CLS] token with small random values
-        nn.init.normal_(self.cls_token, mean=0, std=0.02)
+        # Initialize mask token with small random values
+        nn.init.normal_(self.mask_token_embedding, mean=0, std=0.02)
 
-    def forward(self, x, binned_value=True):
+    def create_gene_mask(self, batch_size, seq_len, device):
         """
-        Forward pass through the scEncoder model.
+        Create random gene mask for MLM training.
         
-        This method processes single-cell RNA-seq data through the transformer
-        architecture and returns predictions from multiple task-specific heads.
+        Args:
+            batch_size (int): Batch size
+            seq_len (int): Sequence length
+            device: Device to create mask on
+            
+        Returns:
+            torch.Tensor: Boolean mask of shape (batch_size, seq_len)
+                         True for positions to be masked
+        """
+        mask = torch.rand(batch_size, seq_len, device=device) < self.mask_prob
+        
+        # Ensure at least one position is masked per sample
+        for i in range(batch_size):
+            if not mask[i].any():
+                # Randomly select one position to mask
+                pos = random.randint(0, seq_len - 1)
+                mask[i, pos] = True
+                
+        return mask
+
+    def forward(self, x, create_mask=True):
+        """
+        Forward pass through the improved scEncoder model.
         
         Args:
             x (dict): Input data dictionary containing:
                 - 'gene_ids': Tensor of shape (batch_size, seq_len) with gene IDs
-                - 'gene_expr': Tensor of shape (batch_size, seq_len) with gene expression values
+                - 'gene_expr': Tensor of shape (batch_size, seq_len) with BINNED gene expression values
                 - 'cell_type' (optional): Tensor of shape (batch_size,) with cell type IDs
                 - 'disease' (optional): Tensor of shape (batch_size,) with disease IDs
                 - 'tissue' (optional): Tensor of shape (batch_size,) with tissue IDs
-            binned_value (bool): Whether gene expression values are already binned.
-                If False, continuous values will be log-transformed and binned. Default: True
+            create_mask (bool): Whether to create random mask for MLM training
             
         Returns:
-            dict: Dictionary containing predictions from all heads:
-                - 'gene_expr': Binned expression value predictions (batch_size, seq_len, num_bins)
-                - 'value': Continuous expression value predictions (batch_size, seq_len, 1)
+            dict: Dictionary containing:
+                - 'gene_expr': Gene expression predictions (batch_size, seq_len, num_bins)
                 - 'gene_ids': Gene identity predictions (batch_size, seq_len, gene_vocab_size)
                 - 'cell_type': Cell type predictions (batch_size, cell_type_vocab_size) or None
                 - 'disease': Disease predictions (batch_size, disease_vocab_size) or None
                 - 'tissue': Tissue predictions (batch_size, tissue_vocab_size) or None
+                - 'mask': Boolean mask used for MLM (batch_size, seq_len) or None
+                - 'hidden_states': Final hidden states (batch_size, seq_len, d_model)
         """
-        # Extract batch and sequence dimensions
-        batch_size, seq_len = x['gene_expr'].size()
+        batch_size, gene_seq_len = x['gene_expr'].size()
         device = x['gene_expr'].device
 
         # ==================== INPUT VALIDATION ====================
-        def validate_input(x, has_cell_type=False, has_disease=False, has_tissue=False):
-            """
-            Validate input tensor shapes and contents.
+        self._validate_input(x, batch_size, gene_seq_len)
+
+        # Ensure sequence length doesn't exceed model capacity
+        if gene_seq_len > self.seq_len:
+            warnings.warn(f"Input sequence length {gene_seq_len} exceeds model capacity {self.seq_len}. Truncating.")
+            gene_seq_len = self.seq_len
+            for key in ['gene_ids', 'gene_expr']:
+                x[key] = x[key][:, :gene_seq_len]
+
+        # ==================== GENE MASKING ====================
+        gene_mask = None
+        if create_mask and self.training:
+            gene_mask = self.create_gene_mask(batch_size, gene_seq_len, device)
             
-            Ensures all required keys are present and tensor dimensions are consistent.
-            This helps catch data preprocessing errors early in the pipeline.
-            """
-            # Check required keys
-            if 'gene_ids' not in x or 'gene_expr' not in x:
-                raise ValueError("Input must contain 'gene_ids' and 'gene_expr'.")
+            # Apply masking - replace masked positions with mask token
+            gene_ids_input = x['gene_ids'].clone()
+            gene_expr_input = x['gene_expr'].clone()
             
-            # Check batch size consistency
-            if x['gene_ids'].size(0) != batch_size or x['gene_expr'].size(0) != batch_size:
-                raise ValueError("Batch size mismatch in input tensors.")
-            
-            # Check sequence length consistency
-            if x['gene_ids'].size(1) != seq_len or x['gene_expr'].size(1) != seq_len:
-                raise ValueError("Sequence length mismatch in input tensors.")
-            
-            # Check optional metadata keys and dimensions
-            if has_cell_type and 'cell_type' not in x:
-                raise ValueError("Input must contain 'cell_type' when has_cell_type is True.")
-            if has_disease and 'disease' not in x:
-                raise ValueError("Input must contain 'disease' when has_disease is True.")
-            if has_tissue and 'tissue' not in x:
-                raise ValueError("Input must contain 'tissue' when has_tissue is True.")
-            
-            # Check metadata tensor dimensions
-            if has_cell_type and x['cell_type'].size(0) != batch_size:
-                raise ValueError("Batch size mismatch in 'cell_type'.")
-            if has_disease and x['disease'].size(0) != batch_size:
-                raise ValueError("Batch size mismatch in 'disease'.")
-            if has_tissue and x['tissue'].size(0) != batch_size:
-                raise ValueError("Batch size mismatch in 'tissue'.")
-            
-        # Perform validation based on available embedding layers
-        validate_input(x, 
-                       has_cell_type=self.cell_embedding is not None, 
-                       has_disease=self.disease_embedding is not None, 
-                       has_tissue=self.tissue_embedding is not None)
+            # Set masked positions to mask token ID
+            gene_ids_input[gene_mask] = self.mask_token_id
+            gene_expr_input[gene_mask] = self.mask_token_id
+        else:
+            gene_ids_input = x['gene_ids']
+            gene_expr_input = x['gene_expr']
 
         # ==================== EMBEDDING COMPUTATION ====================
-        # Compute gene ID embeddings
-        gene_emb = self.gene_embedding(x['gene_ids'])
+        # Compute base embeddings
+        gene_emb = self.gene_embedding(gene_ids_input)  # (batch, seq_len, d_model)
+        value_emb = self.value_embedding(gene_expr_input)  # (batch, seq_len, d_model)
         
-        # Handle gene expression value embeddings
-        if binned_value:
-            # Values are already discretized into bins
-            value_emb = self.value_embedding(x['gene_expr'])
-        else:
-            # Convert continuous values to binned values
-            # Apply log1p transformation to handle the wide dynamic range of gene expression
-            value_emb = torch.log1p(x['gene_expr'])
+        # Add positional embeddings
+        positions = torch.arange(gene_seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        pos_emb = self.position_embedding(positions)  # (batch, seq_len, d_model)
+        
+        # Sum gene, value, and positional embeddings
+        sequence_emb = gene_emb + value_emb + pos_emb
+        
+        # Handle masked positions with special mask token embedding
+        if gene_mask is not None:
+            mask_emb = self.mask_token_embedding.expand(batch_size, gene_seq_len, -1)
+            sequence_emb = torch.where(gene_mask.unsqueeze(-1), mask_emb, sequence_emb)
+
+        # ==================== METADATA EMBEDDING SUMMATION ====================
+        # Sum metadata embeddings directly into the sequence embeddings
+        # This approach broadcasts metadata across all positions
+        
+        if self.cell_embedding and 'cell_type' in x:
+            cell_emb = self.cell_embedding(x['cell_type'])  # (batch, d_model)
+            cell_emb = cell_emb.unsqueeze(1).expand(-1, gene_seq_len, -1)  # (batch, seq_len, d_model)
+            sequence_emb = sequence_emb + cell_emb
             
-            # Normalize and bin the values per sample to handle different expression scales
-            max_val = torch.max(value_emb, dim=-1, keepdim=True)[0]  # Per-sample maximum
-            value_emb = torch.floor(value_emb * (self.num_bins - 1) / (max_val + 1e-6)).long()
-
-            # Convert binned values to embeddings
-            value_emb = self.value_embedding(value_emb.long())
-
-        # Compute optional metadata embeddings
-        cell_emb = self.cell_embedding(x['cell_type']) if self.cell_embedding else None
-        disease_emb = self.disease_embedding(x['disease']) if self.disease_embedding else None
-        tissue_emb = self.tissue_embedding(x['tissue']) if self.tissue_embedding else None
-        
-        # ==================== EMBEDDING COMBINATION ====================
-        # Combine gene and value embeddings additively
-        # This allows the model to learn relationships between gene identity and expression level
-        emb = gene_emb + value_emb
-        
-        # ==================== [CLS] TOKEN PREPARATION ====================
-        # Expand [CLS] token to match batch size
-        cls_token = self.cls_token.expand(batch_size, -1, -1)
-
-        # Add metadata information to [CLS] token
-        # This encodes sample-level information that can be used for classification tasks
-        if cell_emb is not None:
-            cls_token = cls_token + cell_emb.unsqueeze(1)  # Add sequence dimension
-        if disease_emb is not None:
-            cls_token = cls_token + disease_emb.unsqueeze(1)
-        if tissue_emb is not None:
-            cls_token = cls_token + tissue_emb.unsqueeze(1)
-        
-        # ==================== SEQUENCE CONSTRUCTION ====================
-        # Concatenate [CLS] token with gene embeddings
-        # Final sequence: [CLS] + gene_1 + gene_2 + ... + gene_n
-        x = torch.cat((cls_token, emb), dim=1)
-        seq_len += 1  # Account for [CLS] token
-
-        # Handle sequence length variations through padding/truncation
-        if seq_len < self.seq_len:
-            # Pad sequence to fixed length with zeros
-            pad_size = self.seq_len - x.size(1)
-            x = F.pad(x, (0, 0, 0, pad_size), value=0)
-        elif x.size(1) > self.seq_len:
-            # Truncate sequence if it exceeds maximum length
-            warnings.warn("Input sequence length exceeds the model's expected sequence length. Truncating to fit.")
-            x = x[:, :self.seq_len, :]
+        if self.disease_embedding and 'disease' in x:
+            disease_emb = self.disease_embedding(x['disease'])  # (batch, d_model)
+            disease_emb = disease_emb.unsqueeze(1).expand(-1, gene_seq_len, -1)  # (batch, seq_len, d_model)
+            sequence_emb = sequence_emb + disease_emb
             
-        # Apply dropout for regularization
-        x = self.dropout_layer(x)
+        if self.tissue_embedding and 'tissue' in x:
+            tissue_emb = self.tissue_embedding(x['tissue'])  # (batch, d_model)
+            tissue_emb = tissue_emb.unsqueeze(1).expand(-1, gene_seq_len, -1)  # (batch, seq_len, d_model)
+            sequence_emb = sequence_emb + tissue_emb
 
-        # ==================== ATTENTION MASK CREATION ====================
-        # Create attention mask to ignore padded positions
-        # 1 = attend to this position, 0 = ignore this position
-        attention_mask = torch.ones(batch_size, self.seq_len, device=device)
-        if seq_len < self.seq_len:
-            attention_mask[:, seq_len:] = 0
+        # ==================== SEQUENCE PROCESSING ====================
+        # Apply input normalization and dropout
+        sequence_emb = self.input_norm(sequence_emb)
+        sequence_emb = self.dropout_layer(sequence_emb)
+        
+        # Handle padding if needed
+        if gene_seq_len < self.seq_len:
+            pad_size = self.seq_len - gene_seq_len
+            sequence_emb = F.pad(sequence_emb, (0, 0, 0, pad_size), value=0)
+            
+        # Create attention mask
+        attention_mask = torch.ones(batch_size, self.seq_len, device=device, dtype=torch.bool)
+        if gene_seq_len < self.seq_len:
+            attention_mask[:, gene_seq_len:] = False
 
         # ==================== TRANSFORMER FORWARD PASS ====================
-        if self.gradient_checkpointing:
-            # Use gradient checkpointing to save memory during training
-            # This trades computation for memory by recomputing activations during backward pass
+        if self.gradient_checkpointing and self.training:
             def create_custom_forward(module):
                 def custom_forward(*inputs):
                     return module(*inputs)
                 return custom_forward
             
-            # Apply checkpointing to each transformer layer
+            hidden_states = sequence_emb
             for layer in self.transformer_encoder.layers:
-                x = checkpoint(create_custom_forward(layer), x, None, (attention_mask == 0))
+                hidden_states = checkpoint(
+                    create_custom_forward(layer), 
+                    hidden_states, 
+                    None, 
+                    ~attention_mask  # Invert mask for padding positions
+                )
         else:
-            # Standard forward pass through all transformer layers
-            x = self.transformer_encoder(x, src_key_padding_mask=(attention_mask == 0))
+            hidden_states = self.transformer_encoder(
+                sequence_emb, 
+                src_key_padding_mask=~attention_mask  # Invert mask for padding positions
+            )
 
-        # Apply final layer normalization
-        x = self.norm(x)
+        # Extract only the actual sequence length (remove padding)
+        hidden_states = hidden_states[:, :gene_seq_len, :] # type: ignore
 
-        # ==================== OUTPUT HEAD PREDICTIONS ====================
-        # Generate predictions from all available output heads
-        # Skip [CLS] token (position 0) for token-level predictions
+        # ==================== OUTPUT GENERATION ====================
+        # Token-level predictions
+        gene_expr_pred = self.gene_expr_head(hidden_states)  # (batch, seq_len, num_bins)
+        gene_ids_pred = self.gene_id_head(hidden_states)     # (batch, seq_len, gene_vocab_size)
+        
+        # Global predictions using mean pooling
+        # Create pooling mask to ignore padded positions
+        pooling_mask = torch.ones(batch_size, gene_seq_len, device=device)
+        if gene_mask is not None:
+            # Optionally exclude masked positions from pooling
+            pooling_mask = pooling_mask & (~gene_mask)
+        
+        # Compute weighted average
+        pooled_repr = (hidden_states * pooling_mask.unsqueeze(-1)).sum(dim=1) / pooling_mask.sum(dim=1, keepdim=True)
+        
+        # Generate metadata predictions
+        cell_type_pred = self.cell_type_head(pooled_repr) if self.cell_type_head else None
+        disease_pred = self.disease_head(pooled_repr) if self.disease_head else None
+        tissue_pred = self.tissue_head(pooled_repr) if self.tissue_head else None
+        
         outputs = {
-            # Token-level predictions
-            'gene_expr': self.mlm_output(x),      # Binned expression predictions
-            'value': self.continuous_output(x),   # Continuous value predictions  
-            'gene_ids': self.gene_output(x),      # Gene identity predictions
-            
-            # Sequence-level predictions (use [CLS] token)
-            'cell_type': self.cell_output(x[:, 0, :]) if self.cell_output else None,
-            'disease': self.disease_output(x[:, 0, :]) if self.disease_output else None,
-            'tissue': self.tissue_output(x[:, 0, :]) if self.tissue_output else None
+            'gene_expr': gene_expr_pred,
+            'gene_ids': gene_ids_pred,
+            'cell_type': cell_type_pred,
+            'disease': disease_pred,
+            'tissue': tissue_pred,
+            'mask': gene_mask,
+            'hidden_states': hidden_states
         }
         
         return outputs
+
+    def _validate_input(self, x, batch_size, seq_len):
+        """Validate input tensor shapes and contents."""
+        # Check required keys
+        if 'gene_ids' not in x or 'gene_expr' not in x:
+            raise ValueError("Input must contain 'gene_ids' and 'gene_expr'.")
+        
+        # Check batch size consistency
+        if x['gene_ids'].size(0) != batch_size or x['gene_expr'].size(0) != batch_size:
+            raise ValueError("Batch size mismatch in input tensors.")
+        
+        # Check sequence length consistency
+        if x['gene_ids'].size(1) != seq_len or x['gene_expr'].size(1) != seq_len:
+            raise ValueError("Sequence length mismatch in input tensors.")
+        
+        # Check that gene expression values are properly binned
+        if torch.any(x['gene_expr'] >= self.num_bins) or torch.any(x['gene_expr'] < 0):
+            raise ValueError(f"Gene expression values must be binned in range [0, {self.num_bins-1}]")
+        
+        # Check optional metadata
+        if self.cell_embedding and 'cell_type' in x:
+            if x['cell_type'].size(0) != batch_size:
+                raise ValueError("Batch size mismatch in 'cell_type'.")
+        if self.disease_embedding and 'disease' in x:
+            if x['disease'].size(0) != batch_size:
+                raise ValueError("Batch size mismatch in 'disease'.")
+        if self.tissue_embedding and 'tissue' in x:
+            if x['tissue'].size(0) != batch_size:
+                raise ValueError("Batch size mismatch in 'tissue'.")
+
+    def get_attention_weights(self, x, layer_idx=-1):
+        """
+        Extract attention weights for visualization.
+        
+        Args:
+            x (dict): Input data dictionary
+            layer_idx (int): Which transformer layer to extract weights from (-1 for last layer)
+            
+        Returns:
+            torch.Tensor: Attention weights of shape (batch_size, num_heads, seq_len, seq_len)
+        """
+        # This would require modifying the transformer to return attention weights
+        # For now, we'll raise a NotImplementedError
+        raise NotImplementedError("Attention weight extraction requires custom transformer implementation")
+    
+    def get_embeddings(self, x):
+        """
+        Get the final hidden states without prediction heads.
+        
+        Args:
+            x (dict): Input data dictionary
+            
+        Returns:
+            torch.Tensor: Hidden states of shape (batch_size, seq_len, d_model)
+        """
+        with torch.no_grad():
+            outputs = self.forward(x, create_mask=False)
+            return outputs['hidden_states']
