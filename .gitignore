@@ -3,3 +3,6 @@ __pycache__/
 *.h5ad
 *.pth
 old_model/
+.venv/
+.venv_ps/
+unused/
