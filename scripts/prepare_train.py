@@ -192,6 +192,87 @@ def shuffle_anndata(adata, random_state=42):
     print(f"Dataset shuffled: {adata_shuffled.n_obs} cells")
     return adata_shuffled
 
+def create_combined_vocabularies():
+    """
+    Create combined vocabularies from all datasets.
+    """
+    print("\nCreating combined vocabularies...")
+    
+    all_genes = set()
+    all_celltypes = set()
+    all_tissues = set()
+    all_diseases = set()
+    
+    temp_vocab_files = []  # Track temporary vocab files for cleanup
+    
+    # Collect all unique values from individual vocabularies
+    for idx in range(len(datasets)):
+        try:
+            import json
+            
+            # Load individual vocabularies
+            temp_gene_vocab = f"vocab/gene_vocab_{idx}.json"
+            temp_celltype_vocab = f"vocab/celltype_vocab_{idx}.json"
+            temp_tissue_vocab = f"vocab/tissue_vocab_{idx}.json"
+            temp_disease_vocab = f"vocab/disease_vocab_{idx}.json"
+            
+            temp_vocab_files.extend([temp_gene_vocab, temp_celltype_vocab, temp_tissue_vocab, temp_disease_vocab])
+            
+            with open(temp_gene_vocab, 'r') as f:
+                gene_vocab = json.load(f)
+                all_genes.update(gene_vocab.keys())
+            
+            with open(temp_celltype_vocab, 'r') as f:
+                celltype_vocab = json.load(f)
+                all_celltypes.update(celltype_vocab.keys())
+            
+            with open(temp_tissue_vocab, 'r') as f:
+                tissue_vocab = json.load(f)
+                all_tissues.update(tissue_vocab.keys())
+            
+            with open(temp_disease_vocab, 'r') as f:
+                disease_vocab = json.load(f)
+                all_diseases.update(disease_vocab.keys())
+                
+        except FileNotFoundError:
+            print(f"Warning: Could not find vocabulary files for dataset {idx}")
+            continue
+    
+    # Create combined vocabularies
+    combined_gene_vocab = {gene: idx for idx, gene in enumerate(sorted(all_genes))}
+    combined_celltype_vocab = {celltype: idx for idx, celltype in enumerate(sorted(all_celltypes))}
+    combined_tissue_vocab = {tissue: idx for idx, tissue in enumerate(sorted(all_tissues))}
+    combined_disease_vocab = {disease: idx for idx, disease in enumerate(sorted(all_diseases))}
+    
+    # Save combined vocabularies
+    import json
+    with open("vocab/gene_vocab.json", 'w') as f:
+        json.dump(combined_gene_vocab, f, indent=2)
+    
+    with open("vocab/celltype_vocab.json", 'w') as f:
+        json.dump(combined_celltype_vocab, f, indent=2)
+    
+    with open("vocab/tissue_vocab.json", 'w') as f:
+        json.dump(combined_tissue_vocab, f, indent=2)
+    
+    with open("vocab/disease_vocab.json", 'w') as f:
+        json.dump(combined_disease_vocab, f, indent=2)
+    
+    print(f"Combined vocabularies created:")
+    print(f"  - Genes: {len(combined_gene_vocab)}")
+    print(f"  - Cell types: {len(combined_celltype_vocab)}")
+    print(f"  - Tissues: {len(combined_tissue_vocab)}")
+    print(f"  - Diseases: {len(combined_disease_vocab)}")
+    
+    # Clean up temporary vocabulary files
+    print("\nCleaning up temporary vocabulary files...")
+    for temp_file in temp_vocab_files:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+            print(f"Removed: {temp_file}")
+    
+    print("Temporary vocabulary files cleanup complete!")
+
 def prepare_data(use_gpu=True, batch_size=10000):
     """
     Downloads datasets, bins expression data, builds vocabularies, and shuffles data.
@@ -204,6 +285,8 @@ def prepare_data(use_gpu=True, batch_size=10000):
     os.makedirs("dataset", exist_ok=True)
     os.makedirs("vocab", exist_ok=True)
 
+    temp_files = []  # Track all temporary files for cleanup
+    
     # Download and process each dataset
     for idx, url in enumerate(datasets):
         print(f"\n{'='*60}")
@@ -214,6 +297,7 @@ def prepare_data(use_gpu=True, batch_size=10000):
         # Download dataset
         temp_filename = f"dataset/temp_dataset_{idx}.h5ad"
         final_filename = f"dataset/dataset_{idx}.h5ad"
+        temp_files.append(temp_filename)
         
         print(f"Downloading dataset {idx+1}/{len(datasets)}...")
         download_dataset(url, temp_filename)
@@ -263,10 +347,6 @@ def prepare_data(use_gpu=True, batch_size=10000):
         print(f"Saving processed dataset to {final_filename}...")
         adata_shuffled.write_h5ad(final_filename, compression='gzip')
         
-        # Remove temporary file
-        os.remove(temp_filename)
-        print(f"Removed temporary file: {temp_filename}")
-        
         # Memory cleanup
         del adata, adata_binned, adata_shuffled
         gc.collect()
@@ -281,69 +361,15 @@ def prepare_data(use_gpu=True, batch_size=10000):
         # Print file size comparison
         file_size_mb = os.path.getsize(final_filename) / (1024 * 1024)
         print(f"File size: {file_size_mb:.2f} MB")
-
-def create_combined_vocabularies():
-    """
-    Create combined vocabularies from all datasets.
-    """
-    print("\nCreating combined vocabularies...")
     
-    all_genes = set()
-    all_celltypes = set()
-    all_tissues = set()
-    all_diseases = set()
+    # Clean up temporary dataset files
+    print("\nCleaning up temporary dataset files...")
+    for temp_file in temp_files:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+            print(f"Removed: {temp_file}")
     
-    # Collect all unique values from individual vocabularies
-    for idx in range(len(datasets)):
-        try:
-            import json
-            
-            # Load individual vocabularies
-            with open(f"vocab/gene_vocab_{idx}.json", 'r') as f:
-                gene_vocab = json.load(f)
-                all_genes.update(gene_vocab.keys())
-            
-            with open(f"vocab/celltype_vocab_{idx}.json", 'r') as f:
-                celltype_vocab = json.load(f)
-                all_celltypes.update(celltype_vocab.keys())
-            
-            with open(f"vocab/tissue_vocab_{idx}.json", 'r') as f:
-                tissue_vocab = json.load(f)
-                all_tissues.update(tissue_vocab.keys())
-            
-            with open(f"vocab/disease_vocab_{idx}.json", 'r') as f:
-                disease_vocab = json.load(f)
-                all_diseases.update(disease_vocab.keys())
-                
-        except FileNotFoundError:
-            print(f"Warning: Could not find vocabulary files for dataset {idx}")
-            continue
-    
-    # Create combined vocabularies
-    combined_gene_vocab = {gene: idx for idx, gene in enumerate(sorted(all_genes))}
-    combined_celltype_vocab = {celltype: idx for idx, celltype in enumerate(sorted(all_celltypes))}
-    combined_tissue_vocab = {tissue: idx for idx, tissue in enumerate(sorted(all_tissues))}
-    combined_disease_vocab = {disease: idx for idx, disease in enumerate(sorted(all_diseases))}
-    
-    # Save combined vocabularies
-    import json
-    with open("vocab/gene_vocab.json", 'w') as f:
-        json.dump(combined_gene_vocab, f, indent=2)
-    
-    with open("vocab/celltype_vocab.json", 'w') as f:
-        json.dump(combined_celltype_vocab, f, indent=2)
-    
-    with open("vocab/tissue_vocab.json", 'w') as f:
-        json.dump(combined_tissue_vocab, f, indent=2)
-    
-    with open("vocab/disease_vocab.json", 'w') as f:
-        json.dump(combined_disease_vocab, f, indent=2)
-    
-    print(f"Combined vocabularies created:")
-    print(f"  - Genes: {len(combined_gene_vocab)}")
-    print(f"  - Cell types: {len(combined_celltype_vocab)}")
-    print(f"  - Tissues: {len(combined_tissue_vocab)}")
-    print(f"  - Diseases: {len(combined_disease_vocab)}")
+    print("Temporary dataset files cleanup complete!")
 
 if __name__ == "__main__":
     # You can adjust the batch_size based on your GPU memory
@@ -359,4 +385,5 @@ if __name__ == "__main__":
     print("- Shuffled datasets") 
     print("- Compressed and saved processed files")
     print("- Created vocabularies")
+    print("- Cleaned up all temporary files")
     print("="*60)

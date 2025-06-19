@@ -20,7 +20,7 @@ import anndata
 
 from models.scEncoder import scEncoder
 from dataset.SingleCellDataset import SingleCellDataset
-from utils.utils import load_vocabulary
+from utils.utils import load_vocabulary, build_gene_vocab, build_celltype_tissue_disease_vocab
 
 # --- Configuration ---
 DATA_DIR = "dataset"  # Directory containing .h5ad files
@@ -35,21 +35,158 @@ BATCH_SIZE = 32
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 N_CLUSTERS = 10  # Set as needed
 
-# --- Load vocabularies ---
-gene_vocab = load_vocabulary(GENE_VOCAB_PATH)
-cell_type_vocab = load_vocabulary(CELL_TYPE_VOCAB_PATH)
-disease_vocab = load_vocabulary(DISEASE_VOCAB_PATH)
-tissue_vocab = load_vocabulary(TISSUE_VOCAB_PATH)
+def update_vocabularies_from_datasets():
+    """
+    Update vocabularies using the same pipeline as prepare_train.py.
+    Creates combined vocabularies from all datasets in the DATA_DIR.
+    """
+    print("Updating vocabularies from all datasets...")
+    
+    # Create vocab directory if it doesn't exist
+    os.makedirs("vocab", exist_ok=True)
+    
+    # Get all .h5ad files
+    data_files = glob.glob(os.path.join(DATA_DIR, "*.h5ad"))
+    if not data_files:
+        raise FileNotFoundError(f"No .h5ad files found in {DATA_DIR}")
+    
+    print(f"Found {len(data_files)} dataset files:")
+    for i, file in enumerate(data_files):
+        print(f"  {i+1}. {file}")
+    
+    all_genes = set()
+    all_celltypes = set()
+    all_tissues = set()
+    all_diseases = set()
+    
+    temp_vocab_files = []  # Track temporary vocab files for cleanup
+    
+    # Process each dataset to build individual vocabularies
+    for idx, data_file in enumerate(data_files):
+        print(f"\nProcessing dataset {idx+1}/{len(data_files)}: {os.path.basename(data_file)}")
+        
+        try:
+            # Build vocabularies for this dataset
+            temp_gene_vocab = f"vocab/gene_vocab_{idx}.json"
+            temp_celltype_vocab = f"vocab/celltype_vocab_{idx}.json"
+            temp_tissue_vocab = f"vocab/tissue_vocab_{idx}.json"
+            temp_disease_vocab = f"vocab/disease_vocab_{idx}.json"
+            
+            temp_vocab_files.extend([temp_gene_vocab, temp_celltype_vocab, temp_tissue_vocab, temp_disease_vocab])
+            
+            # Build gene vocabulary
+            gene_vocab = build_gene_vocab(
+                adata_file=data_file,
+                vocab_file=temp_gene_vocab
+            )
+            
+            # Build cell type, tissue, and disease vocabularies
+            celltype_vocab, tissue_vocab, disease_vocab = build_celltype_tissue_disease_vocab(
+                adata_file=data_file,
+                celltype_vocab_file=temp_celltype_vocab,
+                tissue_vocab_file=temp_tissue_vocab,
+                disease_vocab_file=temp_disease_vocab
+            )
+            
+            # Collect all unique values
+            with open(temp_gene_vocab, 'r') as f:
+                gene_vocab_data = json.load(f)
+                all_genes.update(gene_vocab_data.keys())
+            
+            with open(temp_celltype_vocab, 'r') as f:
+                celltype_vocab_data = json.load(f)
+                all_celltypes.update(celltype_vocab_data.keys())
+            
+            with open(temp_tissue_vocab, 'r') as f:
+                tissue_vocab_data = json.load(f)
+                all_tissues.update(tissue_vocab_data.keys())
+            
+            with open(temp_disease_vocab, 'r') as f:
+                disease_vocab_data = json.load(f)
+                all_diseases.update(disease_vocab_data.keys())
+                
+        except Exception as e:
+            print(f"Warning: Could not process dataset {idx}: {e}")
+            continue
+    
+    # Create combined vocabularies
+    print(f"\nCreating combined vocabularies...")
+    combined_gene_vocab = {gene: idx for idx, gene in enumerate(sorted(all_genes))}
+    combined_celltype_vocab = {celltype: idx for idx, celltype in enumerate(sorted(all_celltypes))}
+    combined_tissue_vocab = {tissue: idx for idx, tissue in enumerate(sorted(all_tissues))}
+    combined_disease_vocab = {disease: idx for idx, disease in enumerate(sorted(all_diseases))}
+    
+    # Save combined vocabularies
+    with open(GENE_VOCAB_PATH, 'w') as f:
+        json.dump(combined_gene_vocab, f, indent=2)
+    
+    with open(CELL_TYPE_VOCAB_PATH, 'w') as f:
+        json.dump(combined_celltype_vocab, f, indent=2)
+    
+    with open(TISSUE_VOCAB_PATH, 'w') as f:
+        json.dump(combined_tissue_vocab, f, indent=2)
+    
+    with open(DISEASE_VOCAB_PATH, 'w') as f:
+        json.dump(combined_disease_vocab, f, indent=2)
+    
+    print(f"Combined vocabularies created:")
+    print(f"  - Genes: {len(combined_gene_vocab)}")
+    print(f"  - Cell types: {len(combined_celltype_vocab)}")
+    print(f"  - Tissues: {len(combined_tissue_vocab)}")
+    print(f"  - Diseases: {len(combined_disease_vocab)}")
+    
+    # Clean up temporary vocabulary files
+    print(f"\nCleaning up temporary vocabulary files...")
+    for temp_file in temp_vocab_files:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+            print(f"Removed: {temp_file}")
+    
+    print("Vocabulary update complete!")
+    
+    return combined_gene_vocab, combined_celltype_vocab, combined_tissue_vocab, combined_disease_vocab
+
+def load_or_update_vocabularies():
+    """
+    Load existing vocabularies or create them if they don't exist or are outdated.
+    """
+    # Check if vocabulary files exist
+    vocab_files_exist = all(os.path.exists(path) for path in [
+        GENE_VOCAB_PATH, CELL_TYPE_VOCAB_PATH, DISEASE_VOCAB_PATH, TISSUE_VOCAB_PATH
+    ])
+    
+    if not vocab_files_exist:
+        print("Vocabulary files not found. Creating new vocabularies...")
+        return update_vocabularies_from_datasets()
+    else:
+        print("Loading existing vocabularies...")
+        gene_vocab = load_vocabulary(GENE_VOCAB_PATH)
+        cell_type_vocab = load_vocabulary(CELL_TYPE_VOCAB_PATH)
+        disease_vocab = load_vocabulary(DISEASE_VOCAB_PATH)
+        tissue_vocab = load_vocabulary(TISSUE_VOCAB_PATH)
+        
+        print(f"Loaded vocabularies:")
+        print(f"  - Genes: {len(gene_vocab)}")
+        print(f"  - Cell types: {len(cell_type_vocab)}")
+        print(f"  - Tissues: {len(tissue_vocab)}")
+        print(f"  - Diseases: {len(disease_vocab)}")
+        
+        return gene_vocab, cell_type_vocab, tissue_vocab, disease_vocab
+
+# --- Update/Load vocabularies ---
+gene_vocab, cell_type_vocab, tissue_vocab, disease_vocab = load_or_update_vocabularies()
 
 # --- Load all AnnData files from directory ---
 data_files = glob.glob(os.path.join(DATA_DIR, "*.h5ad"))
 if not data_files:
     raise FileNotFoundError(f"No .h5ad files found in {DATA_DIR}")
 
+print(f"\nLoading {len(data_files)} datasets for clustering...")
 datasets = []
 all_cell_types = []
 all_tissues = []
-for data_file in data_files:
+for i, data_file in enumerate(data_files):
+    print(f"Loading dataset {i+1}/{len(data_files)}: {os.path.basename(data_file)}")
     adata = anndata.read_h5ad(data_file)
     dataset = SingleCellDataset(
         adata,
@@ -73,7 +210,10 @@ for data_file in data_files:
 combined_dataset = ConcatDataset(datasets)
 dataloader = DataLoader(combined_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
+print(f"Total samples for clustering: {len(combined_dataset)}")
+
 # --- Load model ---
+print(f"Loading model from {CHECKPOINT_PATH}...")
 model = scEncoder(
     gene_vocab_size=len(gene_vocab),
     cell_type_vocab_size=len(cell_type_vocab) if cell_type_vocab else None,
@@ -91,10 +231,16 @@ model = scEncoder(
 model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
 model.eval()
 
+print(f"Model loaded successfully. Using device: {DEVICE}")
+
 # --- Extract pooled embeddings ---
+print("Extracting pooled embeddings...")
 all_pooled_embeddings = []
 with torch.no_grad():
-    for batch in dataloader:
+    for i, batch in enumerate(dataloader):
+        if (i + 1) % 100 == 0:
+            print(f"Processing batch {i+1}/{len(dataloader)}...")
+        
         # Prepare input dictionary
         inputs = {
             'gene_ids': batch['gene_ids'].to(DEVICE),
@@ -128,12 +274,15 @@ with torch.no_grad():
         all_pooled_embeddings.append(pooled_emb)
 
 all_pooled_embeddings = np.concatenate(all_pooled_embeddings, axis=0)
+print(f"Extracted embeddings shape: {all_pooled_embeddings.shape}")
 
 # --- Clustering ---
+print(f"Performing K-means clustering with {N_CLUSTERS} clusters...")
 kmeans = KMeans(n_clusters=N_CLUSTERS, random_state=42)
 cluster_labels = kmeans.fit_predict(all_pooled_embeddings)
 
 # --- Compute clustering metrics ---
+print("Computing clustering metrics...")
 metrics = {}
 # Silhouette Coefficient
 metrics['silhouette_score'] = float(silhouette_score(all_pooled_embeddings, cluster_labels))
@@ -160,6 +309,7 @@ metrics['dunn_index'] = dunn_index(all_pooled_embeddings, cluster_labels)
 
 # ARI and NMI (only if cell type labels are available)
 if all_cell_types:
+    print("Computing supervised clustering metrics...")
     cell_type_labels = np.array([cell_type_vocab.get(ct, 0) for ct in all_cell_types])
     metrics['adjusted_rand_score'] = float(adjusted_rand_score(cell_type_labels, cluster_labels))
     metrics['normalized_mutual_info_score'] = float(normalized_mutual_info_score(cell_type_labels, cluster_labels))
@@ -171,11 +321,12 @@ os.makedirs("output", exist_ok=True)
 with open("output/clustering_metrics.json", "w") as f:
     json.dump(metrics, f, indent=4)
 
-print("Clustering Metrics:")
+print("\nClustering Metrics:")
 for metric, value in metrics.items():
     print(f"{metric}: {value:.4f}")
 
 # --- Visualization with UMAP ---
+print("Generating UMAP visualization...")
 umap_reducer = umap.UMAP(n_components=2, random_state=42)
 emb_2d = umap_reducer.fit_transform(all_pooled_embeddings)
 
@@ -192,6 +343,7 @@ plt.close()
 
 # Plot with cell types (if available)
 if all_cell_types:
+    print("Generating cell type visualization...")
     unique_cell_types = np.unique(all_cell_types)
     cell_type_indices = np.array([list(unique_cell_types).index(ct) for ct in all_cell_types])
     
@@ -214,6 +366,7 @@ if all_cell_types:
 
 # Plot with tissue types (if available)
 if all_tissues:
+    print("Generating tissue type visualization...")
     unique_tissues = np.unique(all_tissues)
     tissue_indices = np.array([list(unique_tissues).index(t) for t in all_tissues])
     
@@ -235,6 +388,7 @@ if all_tissues:
     plt.close()
 
 # --- Save cluster labels and embeddings ---
+print("Saving results...")
 np.save("output/scencoder_cluster_labels.npy", cluster_labels)
 np.save("output/scencoder_pooled_embeddings.npy", all_pooled_embeddings)
 np.save("output/scencoder_umap_embeddings.npy", emb_2d)
@@ -243,3 +397,4 @@ print(f"\nClustering analysis complete!")
 print(f"Found {len(all_pooled_embeddings)} samples")
 print(f"Generated {N_CLUSTERS} clusters")
 print(f"Results saved in 'output/' directory")
+print(f"Vocabulary files updated and saved in 'vocab/' directory")
