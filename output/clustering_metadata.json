@@ -1,0 +1,6 @@
+{
+    "total_samples": 806646,
+    "n_clusters": 10,
+    "batch_size": 128,
+    "num_embedding_files": 17
+}

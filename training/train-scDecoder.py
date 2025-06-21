@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, Dataset, ConcatDataset
 from torch.cuda.amp.autocast_mode import autocast
 from torch.cuda.amp.grad_scaler import GradScaler
 from models.scDecoder import scDecoder
-from dataset.SingleCellDataset import SingleCellDataset
+from data.SingleCellDataset import SingleCellDataset
 from utils.utils import setup_logging, load_vocabulary
 from models.scDecoderLoss import scdecoder_loss
 import numpy as np

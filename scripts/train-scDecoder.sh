@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Configuration
-DATA_DIR="dataset"
+DATA_DIR="data"
 GENE_VOCAB="vocab/gene_vocab.json"
 CELL_TYPE_VOCAB="vocab/celltype_vocab.json" # Optional
 DISEASE_VOCAB="vocab/disease_vocab.json"    # Optional
