@@ -19,7 +19,8 @@ from torch.cuda.amp.grad_scaler import GradScaler
 from models.scEncoder import scEncoder
 from data.SingleCellDataset import SingleCellDataset
 from utils.utils import setup_logging, load_vocabulary
-from models.scEncoderLoss import scencoder_loss
+from models.scEncoderLoss import scEncoderLoss
+from info_nce import InfoNCE, info_nce
 import numpy as np
 import anndata
 from scipy.sparse import issparse
@@ -56,8 +57,6 @@ def train(args):
             adata, 
             gene_vocab, 
             cell_type_vocab, 
-            disease_vocab, 
-            tissue_vocab, 
             num_bins=args.num_bins, 
             seq_len=args.seq_len
         )
@@ -70,20 +69,23 @@ def train(args):
     # Initialize model
     model = scEncoder(
         gene_vocab_size=len(gene_vocab),
-        cell_type_vocab_size=len(cell_type_vocab) if cell_type_vocab else None,
-        disease_vocab_size=len(disease_vocab) if disease_vocab else None,
-        tissue_vocab_size=len(tissue_vocab) if tissue_vocab else None,
+        cell_vocab_size=len(cell_type_vocab) if cell_type_vocab else 1,  # fallback to 1 if None
         num_bins=args.num_bins,
         seq_len=args.seq_len,
         d_model=args.d_model,
-        nhead=args.nhead,
+        num_heads=args.nhead,
         num_layers=args.num_layers,
-        hidden_dim=args.hidden_dim,
         dropout=args.dropout,
-        gradient_checkpointing=args.gradient_checkpointing,
-        mask_prob=args.mlm_prob,  # Pass MLM probability to model
-        mask_token_id=0  # Assuming 0 is the mask token ID
+        device=args.device,
+        gradient_checkpointing=args.gradient_checkpointing
     ).to(args.device)
+
+    # Define loss functions
+    mlm_loss_fn = nn.CrossEntropyLoss()
+    contrastive_loss_fn = info_nce()
+    loss_fn = scEncoderLoss(mlm_loss_fn, contrastive_loss_fn)
+    mlm_weight = args.mlm_weight
+    contrastive_weight = args.contrastive_weight
     
     # Load checkpoint if provided
     if args.checkpoint_path and os.path.exists(args.checkpoint_path):
@@ -120,14 +122,7 @@ def train(args):
                 # Required inputs
                 inputs['gene_ids'] = data['gene_ids'].to(args.device, non_blocking=True)
                 inputs['gene_expr'] = data['gene_expr'].to(args.device, non_blocking=True)
-                
-                # Optional metadata inputs - only add if they exist and are not None/empty
-                if 'cell_type' in data and data['cell_type'] is not None:
-                    inputs['cell_type'] = data['cell_type'].to(args.device, non_blocking=True)
-                if 'disease' in data and data['disease'] is not None:
-                    inputs['disease'] = data['disease'].to(args.device, non_blocking=True)
-                if 'tissue' in data and data['tissue'] is not None:
-                    inputs['tissue'] = data['tissue'].to(args.device, non_blocking=True)
+                inputs['cell_type'] = data['cell_type'].to(args.device, non_blocking=True)
                 
                 # Forward pass with mixed precision - let model create its own mask
                 with autocast(enabled=args.device == 'cuda'):

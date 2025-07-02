@@ -1,7 +1,0 @@
-{
-    "total_samples": 806646,
-    "n_clusters": 1533,
-    "batch_size": 128,
-    "num_embedding_files": 17,
-    "k_neighbors": 15
-}
