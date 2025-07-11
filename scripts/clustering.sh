@@ -1,3 +1,10 @@
+#!/bin/bash
+
+# Create output and log directories
+mkdir -p "output"
+mkdir -p "logs"
+
+# Run clustering script in background
 nohup python3 scripts/clustering.py > "logs/clustering.log" 2> "logs/clustering.err" &
 echo $! > "logs/clustering.pid"
 echo "Clustering script started with PID $(cat logs/clustering.pid)"

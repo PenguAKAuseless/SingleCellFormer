@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Configuration
-DATA_DIR="data"
+DATA_DIR="/mnt/nasdev2/pengu-space/train"
 GENE_VOCAB="vocab/gene_vocab.json"
 CELL_TYPE_VOCAB="vocab/celltype_vocab.json" # Optional
 OUTPUT_DIR="output"
@@ -21,11 +21,12 @@ DROPOUT=0.1
 CHECKPOINT_INTERVAL=5
 LOG_INTERVAL=100
 NUM_WORKERS=4
-DEVICE="cuda:0"                              # Use "cpu" if CUDA is not available
+DEVICE="cuda:1"                              # Use "cpu" if CUDA is not available
 MLM_PROB=0.15
 MLM_WEIGHT=1.0
 CONTRASTIVE_WEIGHT=0.1
-GRADIENT_CHECKPOINTING="--gradient-checkpointing"
+# Remove gradient checkpointing for now as it's causing issues
+# GRADIENT_CHECKPOINTING="--gradient-checkpointing"
 
 # Create output and log directories
 mkdir -p "$OUTPUT_DIR"
@@ -60,7 +61,7 @@ CMD=(
   --mlm-prob "$MLM_PROB"
   --mlm-weight "$MLM_WEIGHT"
   --contrastive-weight "$CONTRASTIVE_WEIGHT"
-  "$GRADIENT_CHECKPOINTING"
+  # "$GRADIENT_CHECKPOINTING"  # Commented out for now
 )
 
 # Add final model path if provided

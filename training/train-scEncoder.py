@@ -90,7 +90,7 @@ def train(args):
     
     # Setup optimizer and scaler
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scaler = GradScaler() if args.device == 'cuda' else None
+    scaler = GradScaler() if torch.cuda.is_available() and args.device.startswith('cuda') else None
     
     # Dynamic batch size adjustment
     batch_size = args.batch_size
@@ -105,29 +105,34 @@ def train(args):
             batch_size=batch_size, 
             shuffle=True, 
             num_workers=args.num_workers,
-            pin_memory=True if args.device == 'cuda' else False
+            pin_memory=True if args.device.startswith('cuda') else False,
+            persistent_workers=True if args.num_workers > 0 else False,
+            prefetch_factor=2 if args.num_workers > 0 else 2
         )
         total_loss = 0
         optimizer.zero_grad()
         
         for batch_idx, data in enumerate(dataloader):
             try:
-                # Prepare inputs
+                # Prepare inputs (non_blocking for async GPU transfer)
                 gene_ids = data['gene_ids'].to(args.device, non_blocking=True)
                 gene_expr = data['gene_expr'].to(args.device, non_blocking=True)
                 cell_type = data['cell_type'].to(args.device, non_blocking=True)
                 
-                # Create mask for MLM
+                # Create mask for MLM (directly on GPU)
                 mask = torch.rand(gene_ids.shape, device=args.device) < args.mlm_prob
                 mask = mask & (gene_expr > 0)  # Only mask non-zero expressions
                 
+                # Ensure CLS token (position 0) is never masked
+                mask[:, 0] = False
+                
                 # Forward pass with mixed precision
-                with autocast(enabled=args.device == 'cuda'):
+                with autocast(enabled=torch.cuda.is_available() and args.device.startswith('cuda')):
                     mlm_gene_id_out, mlm_gene_expr_out, contrastive_out, attn_mask = model(
                         gene_ids, gene_expr, cell_type
                     )
                     
-                    # Calculate MLM losses
+                    # Calculate MLM losses (mask automatically excludes CLS position)
                     mlm_gene_id_loss = loss_fn.calculate_mlm_loss(
                         mlm_gene_id_out[mask], gene_ids[mask]
                     )
@@ -137,8 +142,9 @@ def train(args):
                     mlm_loss = args.mlm_weight * (mlm_gene_id_loss + mlm_gene_expr_loss)
                     
                     # Calculate contrastive loss
+                    cell_emb = model.cell_embedding(cell_type)
                     contrastive_loss = loss_fn.calculate_contrastive_loss(
-                        contrastive_out, cell_type
+                        contrastive_out, cell_emb
                     )
                     contrastive_loss = args.contrastive_weight * contrastive_loss
                     
@@ -146,14 +152,14 @@ def train(args):
                     loss = mlm_loss + contrastive_loss
                 
                 # Backward pass
-                if args.device == 'cuda' and scaler:
+                if torch.cuda.is_available() and args.device.startswith('cuda') and scaler:
                     scaler.scale(loss / accumulation_steps).backward()
                 else:
                     (loss / accumulation_steps).backward()
                 
                 # Perform optimization step after accumulation_steps
                 if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
-                    if args.device == 'cuda' and scaler:
+                    if torch.cuda.is_available() and args.device.startswith('cuda') and scaler:
                         scaler.step(optimizer)
                         scaler.update()
                     else:
@@ -171,8 +177,8 @@ def train(args):
                         f"Contrastive Loss: {contrastive_loss.item():.4f}"
                     )
                 
-                # Clear unused memory
-                if args.device == 'cuda':
+                # Clear unused memory periodically
+                if args.device.startswith('cuda') and batch_idx % 50 == 0:
                     torch.cuda.empty_cache()
                 
             except RuntimeError as e:
@@ -184,10 +190,12 @@ def train(args):
                         batch_size=batch_size, 
                         shuffle=True, 
                         num_workers=args.num_workers,
-                        pin_memory=True if args.device == 'cuda' else False
+                        pin_memory=True if args.device.startswith('cuda') else False,
+                        persistent_workers=True if args.num_workers > 0 else False,
+                        prefetch_factor=2 if args.num_workers > 0 else 2
                     )
                     optimizer.zero_grad()
-                    if args.device == 'cuda':
+                    if args.device.startswith('cuda'):
                         torch.cuda.empty_cache()
                     continue
                 else:
