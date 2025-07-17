@@ -1,9 +1,11 @@
 {
     "total_samples": 738977,
-    "n_clusters": 407,
+    "n_clusters": 406,
     "batch_size": 64,
     "num_embedding_files": 15,
+    "num_cell_type_files": 15,
     "k_neighbors": 15,
-    "extraction_time": "0:07:05.125078",
-    "clustering_time": "0:08:25.562833"
+    "extraction_time": "0:05:14.652309",
+    "clustering_time": "0:07:48.367496",
+    "has_cell_type_data": true
 }
